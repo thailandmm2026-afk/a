@@ -12,15 +12,14 @@ from asyncio import Semaphore
 
 warnings.filterwarnings("ignore")
 
-# ========== Logging ==========
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-for name in ["urllib3", "requests", "telebot", "edge_tts", "asyncio", "httpx",
-             "httpcore", "telegram", "moviepy", "yt_dlp", "whisper"]:
+for name in ["urllib3", "requests", "edge_tts", "asyncio", "httpx", "httpcore",
+             "telegram", "yt_dlp", "whisper", "pydub"]:
     logging.getLogger(name).setLevel(logging.WARNING)
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,37 +29,26 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from moviepy.editor import VideoFileClip, AudioFileClip
 from pydub import AudioSegment
 import yt_dlp
 import whisper
 from deep_translator import GoogleTranslator
 import edge_tts
 
-# ========== Config ==========
+# ==================== CONFIG ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
-executor = ThreadPoolExecutor(max_workers=4)
-global_processing_semaphore = Semaphore(3)
+executor = ThreadPoolExecutor(max_workers=2)
+global_processing_semaphore = Semaphore(1)  # တစ်ချိန်တည်း တစ်ခုပဲ
 
 user_processing_status = {}
 user_status_lock = asyncio.Lock()
 
 VOICES = {
-    "thiha": {
-        "id": "my-MM-ThihaNeural",
-        "name": "Thiha",
-        "gender": "ကျား",
-        "emoji": "👨"
-    },
-    "nilar": {
-        "id": "my-MM-NilarNeural",
-        "name": "Nilar",
-        "gender": "မ",
-        "emoji": "👩"
-    }
+    "thiha": {"id": "my-MM-ThihaNeural", "name": "Thiha", "gender": "ကျား", "emoji": "👨"},
+    "nilar": {"id": "my-MM-NilarNeural", "name": "Nilar", "gender": "မ", "emoji": "👩"}
 }
 
 DEFAULT_VOICE = "thiha"
@@ -76,20 +64,14 @@ whisper_model = None
 whisper_lock = asyncio.Lock()
 DB_FILE = "bot_data.db"
 
-FONT_PATHS = [
-    "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansMyanmarUI-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
-
-# ========== Database ==========
+# ==================== DATABASE ====================
 def get_db_connection():
-    return sqlite3.connect(DB_FILE, timeout=60, check_same_thread=False)
+    return sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
 
 def init_db():
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             voice TEXT DEFAULT 'thiha',
@@ -98,7 +80,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -113,38 +95,36 @@ def init_db():
             processing BOOLEAN DEFAULT 0,
             mode TEXT DEFAULT 'auto',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
     conn.commit()
     conn.close()
 
 def get_user(user_id):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT voice, speed, mode FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT voice, speed, mode FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
     conn.close()
-    if result:
-        return {"voice": result[0], "speed": result[1], "mode": result[2] or "auto"}
+    if row:
+        return {"voice": row[0], "speed": row[1], "mode": row[2] or "auto"}
     return None
 
 def save_user(user_id, voice=None, speed=None, mode=None):
     conn = get_db_connection()
-    cursor = conn.cursor()
+    c = conn.cursor()
     existing = get_user(user_id)
     if existing:
         if voice is not None:
-            cursor.execute("UPDATE users SET voice = ? WHERE user_id = ?", (voice, user_id))
+            c.execute("UPDATE users SET voice = ? WHERE user_id = ?", (voice, user_id))
         if speed is not None:
-            cursor.execute("UPDATE users SET speed = ? WHERE user_id = ?", (speed, user_id))
+            c.execute("UPDATE users SET speed = ? WHERE user_id = ?", (speed, user_id))
         if mode is not None:
-            cursor.execute("UPDATE users SET mode = ? WHERE user_id = ?", (mode, user_id))
+            c.execute("UPDATE users SET mode = ? WHERE user_id = ?", (mode, user_id))
     else:
-        cursor.execute(
+        c.execute(
             "INSERT INTO users (user_id, voice, speed, mode) VALUES (?, ?, ?, ?)",
             (user_id, voice or DEFAULT_VOICE, speed or DEFAULT_SPEED, mode or "auto")
         )
@@ -153,69 +133,52 @@ def save_user(user_id, voice=None, speed=None, mode=None):
 
 def get_session(user_id):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
+    c = conn.cursor()
+    c.execute("""
         SELECT video_path, audio_path, srt_path, transcript_text, translated_text,
                edited_text, video_duration, is_voice, processing, mode
-        FROM sessions
-        WHERE user_id = ?
-        ORDER BY created_at DESC LIMIT 1
+        FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
     """, (user_id,))
-    result = cursor.fetchone()
+    row = c.fetchone()
     conn.close()
-    if result:
+    if row:
         return {
-            "video_path": result[0],
-            "audio_path": result[1],
-            "srt_path": result[2],
-            "transcript_text": result[3],
-            "translated_text": result[4],
-            "edited_text": result[5],
-            "video_duration": result[6],
-            "is_voice": bool(result[7]) if result[7] is not None else False,
-            "processing": bool(result[8]) if result[8] is not None else False,
-            "mode": result[9] or "auto"
+            "video_path": row[0], "audio_path": row[1], "srt_path": row[2],
+            "transcript_text": row[3], "translated_text": row[4], "edited_text": row[5],
+            "video_duration": row[6],
+            "is_voice": bool(row[7]) if row[7] is not None else False,
+            "processing": bool(row[8]) if row[8] is not None else False,
+            "mode": row[9] or "auto"
         }
     return None
 
 def save_session(user_id, data):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
-    result = cursor.fetchone()
-    if result:
-        session_id = result[0]
-        updates = []
-        values = []
-        for key, value in data.items():
-            updates.append(f"{key} = ?")
-            values.append(value)
-        values.append(session_id)
-        cursor.execute(
-            f"UPDATE sessions SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            values
-        )
+    c = conn.cursor()
+    c.execute("SELECT id FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+    row = c.fetchone()
+    if row:
+        updates = [f"{k} = ?" for k in data.keys()]
+        values = list(data.values()) + [row[0]]
+        c.execute(f"UPDATE sessions SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", values)
     else:
-        columns = ", ".join(data.keys())
+        cols = ", ".join(data.keys())
         placeholders = ", ".join(["?"] * len(data))
-        cursor.execute(
-            f"INSERT INTO sessions (user_id, {columns}) VALUES (?, {placeholders})",
-            [user_id] + list(data.values())
-        )
+        c.execute(f"INSERT INTO sessions (user_id, {cols}) VALUES (?, {placeholders})", [user_id] + list(data.values()))
     conn.commit()
     conn.close()
 
 def clear_session(user_id):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    c = conn.cursor()
+    c.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 def delete_old_sessions():
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM sessions WHERE created_at < datetime("now", "-1 hour")')
+    c = conn.cursor()
+    c.execute('DELETE FROM sessions WHERE created_at < datetime("now", "-1 hour")')
     conn.commit()
     conn.close()
 
@@ -226,1325 +189,604 @@ def get_user_mode(user_id):
 def set_user_mode(user_id, mode):
     save_user(user_id, mode=mode)
 
-# ========== Helpers ==========
-def get_user_speed(user_id: int) -> float:
+def get_user_speed(user_id):
     user = get_user(user_id)
     return user["speed"] if user else DEFAULT_SPEED
 
-def get_user_voice(user_id: int) -> str:
+def get_user_voice(user_id):
     user = get_user(user_id)
     return user["voice"] if user else DEFAULT_VOICE
 
-def get_voice_display(voice_key: str) -> str:
-    voice = VOICES.get(voice_key, VOICES[DEFAULT_VOICE])
-    return f"{voice['emoji']} {voice['name']} ({voice['gender']})"
+def get_voice_display(key):
+    v = VOICES.get(key, VOICES[DEFAULT_VOICE])
+    return f"{v['emoji']} {v['name']} ({v['gender']})"
 
-def speed_to_edge_rate(speed: float) -> str:
-    percentage = round((speed - 1.0) * 100)
-    return f"+{percentage}%" if percentage >= 0 else f"{percentage}%"
+def speed_to_edge_rate(speed):
+    p = round((speed - 1.0) * 100)
+    return f"+{p}%" if p >= 0 else f"{p}%"
 
-def cleanup_files(*file_paths):
-    for path in file_paths:
-        if path and os.path.exists(path):
+def cleanup_files(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
             try:
-                os.remove(path)
+                os.remove(p)
             except Exception:
                 pass
 
-def get_video_duration_with_ffmpeg(video_path):
+def get_duration(path):
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip())
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip())
     except Exception:
         pass
     return None
 
-def get_video_dimensions(video_path):
+def get_mp3_duration(path):
+    d = get_duration(path)
+    if d and d > 0:
+        return d
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0",
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.stdout:
-            parts = result.stdout.strip().split(",")
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
-    except Exception:
-        pass
-    return 1920, 1080
-
-def get_mp3_duration_accurate(filepath: str) -> float:
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            filepath
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0 and result.stdout.strip():
-            duration = float(result.stdout.strip())
-            if duration > 0:
-                return duration
-    except Exception:
-        pass
-    try:
-        audio = AudioSegment.from_mp3(filepath)
+        audio = AudioSegment.from_mp3(path)
         return len(audio) / 1000.0
     except Exception:
-        pass
-    return 5.0
+        return 5.0
 
-def split_into_sentences(text: str) -> list:
+# ==================== SRT ====================
+def split_sentences(text):
     text = text.replace("။", "။").replace("၊", "၊")
-    pattern = r"(?<=[။။\?!\.])"
-    sentences = re.split(pattern, text)
-    sentences = [s.strip() for s in sentences if s.strip() and len(s) >= 2]
-    return sentences if sentences else [text.strip()]
+    parts = re.split(r"(?<=[။။\?!\.])", text)
+    parts = [s.strip() for s in parts if s.strip() and len(s) >= 2]
+    return parts if parts else [text.strip()]
 
-def format_timestamp(td: timedelta) -> str:
-    total_seconds = td.total_seconds()
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    seconds = int(total_seconds % 60)
-    milliseconds = int((total_seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+def format_ts(td):
+    total = td.total_seconds()
+    h = int(total // 3600)
+    m = int((total % 3600) // 60)
+    s = int(total % 60)
+    ms = int((total % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def generate_srt_advanced(text: str, voice_name: str, speed: float, actual_duration: float) -> str:
-    sentences = split_into_sentences(text)
-    char_counts = []
+def generate_srt(text, duration):
+    sentences = split_sentences(text)
+    if not sentences:
+        return ""
+    weights = []
     for s in sentences:
-        myanmar_chars = sum(1 for c in s if "\u1000" <= c <= "\u109F")
-        other_chars = len(s) - myanmar_chars
-        char_counts.append(myanmar_chars * 1.2 + other_chars * 1.0)
-    total_weighted = sum(char_counts) or 1
-
-    pause_durations = []
+        my = sum(1 for c in s if "\u1000" <= c <= "\u109F")
+        weights.append(my * 1.2 + (len(s) - my))
+    total_w = sum(weights) or 1
+    pauses = []
     for i in range(len(sentences) - 1):
-        current = sentences[i]
-        if current.endswith(("။", ".", "!", "?")):
-            pause_durations.append(0.4)
-        elif current.endswith(("၊", ",")):
-            pause_durations.append(0.2)
+        if sentences[i].endswith(("။", ".", "!", "?")):
+            pauses.append(0.35)
         else:
-            pause_durations.append(0.3)
+            pauses.append(0.2)
+    speech = max(duration - sum(pauses), duration * 0.85)
+    start = timedelta(0)
+    lines = []
+    for i, sent in enumerate(sentences):
+        dur = max(speech * (weights[i] / total_w), 0.7)
+        if i < len(pauses):
+            dur += pauses[i]
+        end = start + timedelta(seconds=dur)
+        lines.append(str(i + 1))
+        lines.append(f"{format_ts(start)} --> {format_ts(end)}")
+        lines.append(sent)
+        lines.append("")
+        start = end
+    return "\n".join(lines)
 
-    total_pause = sum(pause_durations)
-    speech_duration = max(actual_duration - total_pause, actual_duration * 0.85)
+# ==================== TRANSLATION ====================
+def postprocess(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("ငါ", "ကျွန်တော်").replace("မင်း", "ခင်ဗျား").replace("သင်", "ခင်ဗျား")
+    return text
 
-    start_time = timedelta(seconds=0)
-    srt_lines = []
-    index = 1
-
-    for i, sentence in enumerate(sentences):
-        char_ratio = char_counts[i] / total_weighted
-        sentence_duration = max(speech_duration * char_ratio, 0.8)
-        if i < len(sentences) - 1:
-            sentence_duration += pause_durations[i]
-
-        end_time = start_time + timedelta(seconds=sentence_duration)
-        srt_lines.append(str(index))
-        srt_lines.append(f"{format_timestamp(start_time)} --> {format_timestamp(end_time)}")
-        srt_lines.append(sentence)
-        srt_lines.append("")
-        index += 1
-        start_time = end_time
-
-    return "\n".join(srt_lines)
-
-# ========== Translation ==========
-def preprocess_text(text):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sentences if s.strip()]
-
-def postprocess_text(translated_text):
-    translated_text = re.sub(r"\s+", " ", translated_text).strip()
-    translated_text = translated_text.replace("ငါ", "ကျွန်တော်")
-    translated_text = translated_text.replace("မင်း", "ခင်ဗျား")
-    translated_text = translated_text.replace("သင်", "ခင်ဗျား")
-    return translated_text
-
-def translate_sentence(sentence, src="en", dest="my"):
-    try:
-        if not sentence or not sentence.strip():
-            return sentence
-        translator = GoogleTranslator(source=src, target=dest)
-        translated = translator.translate(sentence)
-        return postprocess_text(translated) if translated else sentence
-    except Exception:
-        return sentence
-
-def translate_story_style(text, src="en", dest="my"):
+def translate_text(text, src="en", dest="my"):
     try:
         if not text or not text.strip():
             return text
-        sentences = preprocess_text(text)
-        translated_sentences = []
-        for sentence in sentences:
-            translated_sentences.append(translate_sentence(sentence, src, dest))
-            time.sleep(0.05)
-        return postprocess_text(" ".join(translated_sentences))
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        results = []
+        translator = GoogleTranslator(source=src, target=dest)
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            try:
+                t = translator.translate(s)
+                results.append(t if t else s)
+            except Exception:
+                results.append(s)
+            time.sleep(0.04)
+        return postprocess(" ".join(results))
     except Exception:
         return text
 
-# ========== Whisper ==========
-def load_whisper_model():
+# ==================== WHISPER (tiny) ====================
+def load_whisper():
     global whisper_model
     if whisper_model is None:
-        logger.info("Loading Whisper model (base)...")
-        whisper_model = whisper.load_model("base")
-        logger.info("Whisper model loaded.")
+        logger.info("Loading Whisper tiny model (low RAM)...")
+        whisper_model = whisper.load_model("tiny")
+        logger.info("Whisper tiny loaded.")
     return whisper_model
 
-async def download_youtube_video(url: str) -> str:
-    try:
-        unique_id = os.urandom(8).hex()
-        video_filename = os.path.join(TEMP_FOLDER, f"video_{int(time.time())}_{unique_id}.mp4")
-        ydl_opts = {
-            "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
-            "outtmpl": video_filename,
-            "quiet": True,
-            "no_warnings": True,
-            "ignoreerrors": True,
-            "socket_timeout": 600,
-            "retries": 5,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                return None
-            downloaded_file = ydl.prepare_filename(info)
-            if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 100000:
-                return downloaded_file
-            for file in os.listdir(TEMP_FOLDER):
-                if unique_id in file and file.endswith(".mp4"):
-                    full_path = os.path.join(TEMP_FOLDER, file)
-                    if os.path.getsize(full_path) > 100000:
-                        return full_path
-            return None
-    except Exception as e:
-        logger.error(f"YouTube download error: {e}")
-        return None
-
-async def download_tiktok_video(url: str) -> str:
-    try:
-        unique_id = os.urandom(8).hex()
-        video_filename = os.path.join(TEMP_FOLDER, f"tiktok_{int(time.time())}_{unique_id}.mp4")
-        ydl_opts = {
-            "format": "best[height<=720]",
-            "outtmpl": video_filename,
-            "quiet": True,
-            "no_warnings": True,
-            "ignoreerrors": True,
-            "socket_timeout": 600,
-            "retries": 5,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                return None
-            downloaded_file = ydl.prepare_filename(info)
-            if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 100000:
-                return downloaded_file
-            for file in os.listdir(TEMP_FOLDER):
-                if unique_id in file and file.endswith(".mp4"):
-                    full_path = os.path.join(TEMP_FOLDER, file)
-                    if os.path.getsize(full_path) > 100000:
-                        return full_path
-            return None
-    except Exception as e:
-        logger.error(f"TikTok download error: {e}")
-        return None
-
-async def transcribe_audio(video_path: str) -> str:
+async def transcribe(video_path):
     try:
         async with whisper_lock:
-            model = load_whisper_model()
-
-        audio_path = video_path.replace(".mp4", ".mp3")
-        cmd = ["ffmpeg", "-i", video_path, "-acodec", "libmp3lame", "-ab", "192k", audio_path, "-y"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0 or not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            model = load_whisper()
+        audio_path = video_path.rsplit(".", 1)[0] + ".mp3"
+        cmd = ["ffmpeg", "-i", video_path, "-acodec", "libmp3lame", "-ab", "128k",
+               "-ar", "16000", "-ac", "1", audio_path, "-y"]
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode != 0 or not os.path.exists(audio_path):
             return None
-
         result = model.transcribe(audio_path, language="my", fp16=False)
-        transcript = result["text"]
-
-        if os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
-        return transcript
+        cleanup_files(audio_path)
+        return result.get("text", "").strip()
     except Exception as e:
         logger.error(f"Transcribe error: {e}")
         return None
 
-# ========== TTS ==========
-async def convert_text_to_mp3(text: str, output_filename: str, speed: float, voice_key: str) -> float:
+# ==================== DOWNLOAD ====================
+async def download_video(url):
+    try:
+        uid = os.urandom(6).hex()
+        out = os.path.join(TEMP_FOLDER, f"vid_{int(time.time())}_{uid}.mp4")
+        opts = {
+            "format": "best[height<=480][ext=mp4]/best[height<=480]/best",
+            "outtmpl": out,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 300,
+            "retries": 3,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+            fname = ydl.prepare_filename(info)
+            if os.path.exists(fname) and os.path.getsize(fname) > 50000:
+                return fname
+            for f in os.listdir(TEMP_FOLDER):
+                if uid in f and f.endswith(".mp4"):
+                    p = os.path.join(TEMP_FOLDER, f)
+                    if os.path.getsize(p) > 50000:
+                        return p
+        return None
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return None
+
+# ==================== TTS ====================
+async def text_to_mp3(text, outfile, speed, voice_key):
     rate = speed_to_edge_rate(speed)
     voice_id = VOICES[voice_key]["id"]
-    communicate = edge_tts.Communicate(
-        text, voice_id, rate=rate, volume=VOICE_VOLUME, pitch=VOICE_PITCH
-    )
-    await communicate.save(output_filename)
-    return get_mp3_duration_accurate(output_filename)
+    communicate = edge_tts.Communicate(text, voice_id, rate=rate, volume=VOICE_VOLUME, pitch=VOICE_PITCH)
+    await communicate.save(outfile)
+    return get_mp3_duration(outfile)
 
-# ========== Subtitle ==========
-def burn_subtitles_ffmpeg(video_path, srt_path, output_path, speed_factor=1.0):
-    try:
-        srt_content = None
-        for encoding in ["utf-8-sig", "utf-8", "utf-16", "cp1252"]:
-            try:
-                with open(srt_path, "r", encoding=encoding) as f:
-                    srt_content = f.read()
-                break
-            except Exception:
-                continue
-        if not srt_content:
-            return False
-
-        srt_content = srt_content.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
-        clean_srt_path = srt_path.replace(".srt", "_clean.srt")
-        with open(clean_srt_path, "w", encoding="utf-8-sig") as f:
-            f.write(srt_content)
-
-        width, height = get_video_dimensions(video_path)
-        margin_v = int(height * 0.10)
-
-        font_name = "Noto Sans Myanmar"
-        for fp in FONT_PATHS:
-            if os.path.exists(fp):
-                font_name = os.path.splitext(os.path.basename(fp))[0]
-                break
-
-        ass_path = clean_srt_path.replace(".srt", ".ass")
-        ass_content = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {width}
-PlayResY: {height}
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_name},15,&H00FFFF00,&H00000000,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,2,1,2,20,20,{margin_v},1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-        blocks = srt_content.strip().split("\n\n")
-        for block in blocks:
-            lines = block.strip().split("\n")
-            if len(lines) >= 3:
-                time_match = re.match(
-                    r"(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})",
-                    lines[1]
-                )
-                if time_match:
-                    start = f"{int(time_match.group(1)):02d}:{int(time_match.group(2)):02d}:{int(time_match.group(3)):02d}.{int(time_match.group(4)):03d}"
-                    end = f"{int(time_match.group(5)):02d}:{int(time_match.group(6)):02d}:{int(time_match.group(7)):02d}.{int(time_match.group(8)):03d}"
-                    text = " ".join(lines[2:]).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-                    ass_content += f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"
-
-        with open(ass_path, "w", encoding="utf-8-sig") as f:
-            f.write(ass_content)
-
-        cmd = ["ffmpeg", "-i", video_path, "-vf", f"ass='{ass_path}'", "-c:a", "copy", "-y", output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        cleanup_files(clean_srt_path, ass_path)
-        return result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception as e:
-        logger.error(f"Burn subtitle error: {e}")
-        return False
-
-# ========== Video Processing ==========
-async def process_video_simple(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+# ==================== COMBINE (ffmpeg only) ====================
+async def combine_video_audio(update, context, user_id, with_srt=False):
     try:
         session = get_session(user_id)
         if not session:
-            raise Exception("No session found")
-
-        video_path = session.get("video_path")
-        audio_path = session.get("audio_path")
-
-        if not video_path or not os.path.exists(video_path):
-            raise Exception("Video file not found")
-        if not audio_path or not os.path.exists(audio_path):
-            raise Exception("Audio file not found")
-
-        progress_msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⏳ Video နဲ့ Audio ပေါင်းစပ်နေပါပြီ..."
-        )
-
-        video_duration = get_video_duration_with_ffmpeg(video_path) or 30
-        try:
-            audio_clip = AudioFileClip(audio_path)
-            audio_duration = audio_clip.duration
-            audio_clip.close()
-        except Exception:
-            audio_duration = video_duration
-
-        speed_factor = video_duration / audio_duration if audio_duration > 0 else 1.0
-
-        await progress_msg.edit_text(
-            f"🔄 Video ကို Audio အတိုင်း ပြင်ဆင်နေပါပြီ...\n"
-            f"⏱️ {video_duration:.1f}s → {audio_duration:.1f}s\n"
-            f"📊 Speed: {speed_factor:.2f}x"
-        )
-
-        audio_mp3 = audio_path
-        if not audio_path.lower().endswith(".mp3"):
-            audio_mp3 = f"audio_{user_id}_{int(time.time())}.mp3"
-            subprocess.run(
-                ["ffmpeg", "-i", audio_path, "-acodec", "libmp3lame", "-ab", "192k", audio_mp3, "-y"],
-                capture_output=True, timeout=300
-            )
-
-        temp_video_path = f"temp_video_{user_id}_{int(time.time())}.mp4"
-        if abs(speed_factor - 1.0) > 0.01:
-            cmd = [
-                "ffmpeg", "-i", video_path,
-                "-filter:v", f"setpts={1/speed_factor}*PTS",
-                "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-y", temp_video_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0 or not os.path.exists(temp_video_path):
-                temp_video_path = video_path
-        else:
-            temp_video_path = video_path
-
-        final_output = f"final_{user_id}_{int(time.time())}.mp4"
-        cmd_combine = [
-            "ffmpeg", "-i", temp_video_path, "-i", audio_mp3,
-            "-c:v", "copy", "-c:a", "aac",
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-shortest", "-y", final_output
-        ]
-        result = subprocess.run(cmd_combine, capture_output=True, text=True, timeout=600)
-
-        if result.returncode != 0:
-            cmd_combine = [
-                "ffmpeg", "-i", temp_video_path, "-i", audio_mp3,
-                "-c:v", "libx264", "-c:a", "aac",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest", "-preset", "fast", "-crf", "23",
-                "-y", final_output
-            ]
-            result = subprocess.run(cmd_combine, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
-                raise Exception("Combine failed")
-
-        if not os.path.exists(final_output) or os.path.getsize(final_output) == 0:
-            raise Exception("Final output empty")
-
-        await progress_msg.edit_text("📤 Video ကို ပို့နေပါပြီ...")
-        with open(final_output, "rb") as f:
-            caption = (
-                f"✅ Video + Audio ပေါင်းစပ်ပြီးပါပြီ!\n"
-                f"⏱️ {audio_duration:.1f}s\n"
-                f"📊 Speed: {speed_factor:.2f}x\n"
-                f"📝 SRT မပါပါ။"
-            )
-            await update.effective_message.reply_video(
-                video=InputFile(f, filename="combined_video.mp4"),
-                caption=caption
-            )
-
-        await progress_msg.delete()
-        cleanup_files(video_path, audio_path, temp_video_path, final_output)
-        if audio_mp3 != audio_path:
-            cleanup_files(audio_mp3)
-        clear_session(user_id)
-
-    except Exception as e:
-        logger.error(f"process_video_simple error: {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"❌ Error: {str(e)[:150]}"
-            )
-        except Exception:
-            pass
-        session = get_session(user_id)
-        if session:
-            cleanup_files(session.get("video_path"), session.get("audio_path"))
-        clear_session(user_id)
-    finally:
-        async with user_status_lock:
-            user_processing_status[user_id] = False
-
-async def process_video_with_audio_speed(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    try:
-        session = get_session(user_id)
-        if not session:
-            raise Exception("No session found")
+            raise Exception("Session not found")
 
         video_path = session.get("video_path")
         audio_path = session.get("audio_path")
         srt_path = session.get("srt_path")
-        original_video_duration = session.get("video_duration", 0)
 
-        if not video_path or not audio_path:
-            raise Exception("Missing video or audio path")
-        if not os.path.exists(video_path):
-            raise Exception(f"Video file not found: {video_path}")
-        if not os.path.exists(audio_path):
-            raise Exception(f"Audio file not found: {audio_path}")
+        if not video_path or not os.path.exists(video_path):
+            raise Exception("Video missing")
+        if not audio_path or not os.path.exists(audio_path):
+            raise Exception("Audio missing")
 
-        progress_msg = await context.bot.send_message(
+        progress = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="⏳ Processing စတင်နေပါပြီ...\n\n🔄 မိနစ်အနည်းငယ် ကြာနိုင်ပါတယ်။"
+            text="⏳ Video + Audio ပေါင်းစပ်နေပါတယ်..."
         )
 
-        await progress_msg.edit_text("🔄 Audio ကို ပြောင်းလဲနေပါပြီ... (၁/၅)")
-        audio_mp3 = f"audio_{user_id}_{int(time.time())}.mp3"
-        conversion_success = False
+        v_dur = get_duration(video_path) or 30
+        a_dur = get_mp3_duration(audio_path)
+        speed_factor = v_dur / a_dur if a_dur > 0 else 1.0
 
-        try:
-            audio = AudioSegment.from_file(audio_path)
-            audio.export(audio_mp3, format="mp3", bitrate="192k")
-            conversion_success = os.path.exists(audio_mp3) and os.path.getsize(audio_mp3) > 0
-        except Exception:
-            pass
-
-        if not conversion_success:
-            result = subprocess.run(
-                ["ffmpeg", "-i", audio_path, "-acodec", "libmp3lame", "-ab", "192k", audio_mp3, "-y"],
-                capture_output=True, timeout=300
-            )
-            conversion_success = result.returncode == 0 and os.path.exists(audio_mp3) and os.path.getsize(audio_mp3) > 0
-
-        if not conversion_success:
-            raise Exception("Audio conversion failed")
-
-        await progress_msg.edit_text("📊 Video နဲ့ Audio အရှည်တွေကို တွက်ချက်နေပါပြီ... (၂/၅)")
-        video_duration = get_video_duration_with_ffmpeg(video_path)
-        if video_duration is None:
-            raise Exception("Cannot get video duration")
-
-        try:
-            audio_clip = AudioFileClip(audio_mp3)
-            audio_duration = audio_clip.duration
-            audio_clip.close()
-        except Exception:
-            raise Exception("Cannot get audio duration")
-
-        speed_factor = video_duration / audio_duration if audio_duration > 0 else 1.0
-
-        await progress_msg.edit_text(
-            f"🔄 Video ကို Audio အတိုင်း ပြင်ဆင်နေပါပြီ... (၃/၅)\n"
-            f"⏱️ {video_duration:.1f}s → {audio_duration:.1f}s\n"
-            f"📊 Speed: {speed_factor:.2f}x"
+        await progress.edit_text(
+            f"🔄 ပြင်ဆင်နေပါတယ်...\n⏱️ {v_dur:.1f}s → {a_dur:.1f}s\n📊 {speed_factor:.2f}x"
         )
 
-        temp_video_path = f"temp_video_{user_id}_{int(time.time())}.mp4"
-        if abs(speed_factor - 1.0) > 0.01:
+        # speed adjust video
+        temp_vid = os.path.join(TEMP_FOLDER, f"tmp_{user_id}_{int(time.time())}.mp4")
+        if abs(speed_factor - 1.0) > 0.02:
             cmd = [
                 "ffmpeg", "-i", video_path,
                 "-filter:v", f"setpts={1/speed_factor}*PTS",
-                "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-y", temp_video_path
+                "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                "-y", temp_vid
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0 or not os.path.exists(temp_video_path):
-                raise Exception("FFmpeg speed adjust failed")
-            video_for_combine = temp_video_path
+            r = subprocess.run(cmd, capture_output=True, timeout=300)
+            if r.returncode != 0 or not os.path.exists(temp_vid):
+                temp_vid = video_path
         else:
-            video_for_combine = video_path
+            temp_vid = video_path
 
-        video_with_subs = video_for_combine
-        if srt_path and os.path.exists(srt_path):
-            await progress_msg.edit_text("📝 SRT subtitle ကို Video ထဲ ထည့်နေပါပြီ... (၄/၅)")
-            video_with_subs = f"video_with_subs_{user_id}_{int(time.time())}.mp4"
-            if burn_subtitles_ffmpeg(video_for_combine, srt_path, video_with_subs, speed_factor):
-                video_for_combine = video_with_subs
-            else:
-                await progress_msg.edit_text("⚠️ SRT ထည့်ရာမှာ အမှားဖြစ်သွားပါတယ်။ Subtitle မပါဘဲ ဆက်လုပ်ပါမယ်။")
-        else:
-            await progress_msg.edit_text("ℹ️ SRT မပါသောကြောင့် subtitle မထည့်တော့ပါ။ (၄/၅)")
+        final = os.path.join(TEMP_FOLDER, f"final_{user_id}_{int(time.time())}.mp4")
 
-        await progress_msg.edit_text("🎵 Audio ကို Video နဲ့ ပေါင်းစပ်နေပါပြီ... (၅/၅)")
-        final_output = f"final_{user_id}_{int(time.time())}.mp4"
-
-        cmd_combine = [
-            "ffmpeg", "-i", video_for_combine, "-i", audio_mp3,
-            "-c:v", "copy", "-c:a", "aac",
+        # simple combine (no subtitle burn for low RAM)
+        cmd = [
+            "ffmpeg", "-i", temp_vid, "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
             "-map", "0:v:0", "-map", "1:a:0",
-            "-shortest", "-y", final_output
+            "-shortest", "-y", final
         ]
-        result = subprocess.run(cmd_combine, capture_output=True, text=True, timeout=600)
-
-        if result.returncode != 0:
-            cmd_combine = [
-                "ffmpeg", "-i", video_for_combine, "-i", audio_mp3,
-                "-c:v", "libx264", "-c:a", "aac",
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode != 0:
+            cmd = [
+                "ffmpeg", "-i", temp_vid, "-i", audio_path,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                "-c:a", "aac", "-b:a", "128k",
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest", "-preset", "fast", "-crf", "23",
-                "-y", final_output
+                "-shortest", "-y", final
             ]
-            result = subprocess.run(cmd_combine, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
+            r = subprocess.run(cmd, capture_output=True, timeout=300)
+            if r.returncode != 0:
                 raise Exception("Combine failed")
 
-        if not os.path.exists(final_output) or os.path.getsize(final_output) == 0:
-            raise Exception("Final output empty")
+        if not os.path.exists(final) or os.path.getsize(final) < 1000:
+            raise Exception("Output empty")
 
-        final_duration = get_video_duration_with_ffmpeg(final_output) or audio_duration
-
-        await progress_msg.edit_text("📤 Video ကို ပို့နေပါပြီ...")
-        with open(final_output, "rb") as f:
+        await progress.edit_text("📤 ပို့နေပါတယ်...")
+        with open(final, "rb") as f:
             caption = (
-                f"✅ ပေါင်းစပ်ပြီးပါပြီ!\n"
-                f"⏱️ နောက်ဆုံး: {final_duration:.1f}s\n"
-                f"🎵 Audio: {audio_duration:.1f}s\n"
+                f"✅ ပြီးပါပြီ!\n"
+                f"⏱️ {a_dur:.1f}s | Speed {speed_factor:.2f}x\n"
+                f"{'📝 SRT ဖိုင်လည်း ပို့ထားပါတယ်' if with_srt and srt_path else '📝 SRT မပါ'}"
             )
-            if original_video_duration > 0:
-                caption += f"📊 မူရင်း: {original_video_duration:.1f}s\n"
-            caption += f"📊 Speed: {speed_factor:.2f}x\n"
-            if srt_path and os.path.exists(srt_path):
-                caption += "📝 SRT ပါပါတယ်။"
-            else:
-                caption += "📝 SRT မပါပါ။"
-
             await update.effective_message.reply_video(
-                video=InputFile(f, filename="combined_video.mp4"),
+                video=InputFile(f, filename="result.mp4"),
                 caption=caption
             )
 
-        await progress_msg.delete()
-        cleanup_files(video_path, audio_path, audio_mp3, temp_video_path, final_output)
-        if srt_path:
-            cleanup_files(srt_path)
-        if "video_with_subs" in locals() and os.path.exists(video_with_subs) and video_with_subs != video_for_combine:
-            cleanup_files(video_with_subs)
+        # send srt separately if exists (no burn → saves RAM)
+        if with_srt and srt_path and os.path.exists(srt_path):
+            with open(srt_path, "rb") as s:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=s,
+                    filename="subtitle.srt",
+                    caption="📝 Subtitle (SRT)"
+                )
+
+        await progress.delete()
+        cleanup_files(video_path, audio_path, temp_vid, final, srt_path)
         clear_session(user_id)
 
     except Exception as e:
-        logger.error(f"process_video_with_audio_speed error: {e}")
+        logger.error(f"Combine error: {e}")
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"❌ Error: {str(e)[:150]}\n💡 Video သေးသေးလေး သုံးကြည့်ပါ။"
+                text=f"❌ Error: {str(e)[:120]}"
             )
         except Exception:
             pass
         session = get_session(user_id)
         if session:
-            cleanup_files(
-                session.get("video_path"),
-                session.get("audio_path"),
-                session.get("srt_path")
-            )
+            cleanup_files(session.get("video_path"), session.get("audio_path"), session.get("srt_path"))
         clear_session(user_id)
     finally:
         async with user_status_lock:
             user_processing_status[user_id] = False
 
-# ========== Keyboards ==========
-def get_settings_keyboard(user_id):
+# ==================== KEYBOARDS ====================
+def settings_kb(user_id):
     speed = get_user_speed(user_id)
-    voice_key = get_user_voice(user_id)
+    voice = get_voice_display(get_user_voice(user_id))
     mode = get_user_mode(user_id)
-    voice_name = get_voice_display(voice_key)
-    mode_text = "ရိုးရိုး (SRT မပါ)" if mode == "simple" else "ပုံမှန် (SRT ပါ)"
-    keyboard = [
-        [InlineKeyboardButton(f"🎤 အသံ: {voice_name}", callback_data="show_voice_menu")],
-        [InlineKeyboardButton(f"⚡ အမြန်နှုန်း: {speed:.1f}x", callback_data="show_speed_menu")],
-        [InlineKeyboardButton(f"📌 Mode: {mode_text}", callback_data="show_mode_menu")],
-        [InlineKeyboardButton("📖 အကူအညီ", callback_data="help_menu")],
-        [InlineKeyboardButton("❌ ပိတ်ရန်", callback_data="close_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    mode_txt = "ရိုးရိုး" if mode == "simple" else "ပုံမှန်"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎤 {voice}", callback_data="show_voice")],
+        [InlineKeyboardButton(f"⚡ {speed:.1f}x", callback_data="show_speed")],
+        [InlineKeyboardButton(f"📌 Mode: {mode_txt}", callback_data="show_mode")],
+        [InlineKeyboardButton("❌ ပိတ်ရန်", callback_data="close")]
+    ])
 
-def get_voice_menu_keyboard(user_id):
-    current_voice = get_user_voice(user_id)
-    keyboard = []
-    for key, voice in VOICES.items():
-        check = "✅ " if key == current_voice else ""
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{check}{voice['emoji']} {voice['name']} ({voice['gender']})",
-                callback_data=f"set_voice_{key}"
-            )
-        ])
-    keyboard.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_settings")])
-    return InlineKeyboardMarkup(keyboard)
+def voice_kb(user_id):
+    cur = get_user_voice(user_id)
+    rows = []
+    for k, v in VOICES.items():
+        check = "✅ " if k == cur else ""
+        rows.append([InlineKeyboardButton(f"{check}{v['emoji']} {v['name']}", callback_data=f"set_voice_{k}")])
+    rows.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
-def get_speed_menu_keyboard(user_id):
-    current_speed = get_user_speed(user_id)
-    keyboard = []
+def speed_kb(user_id):
+    cur = get_user_speed(user_id)
     row = []
-    for speed in SPEED_OPTIONS:
-        check = "✅ " if speed == current_speed else ""
-        row.append(InlineKeyboardButton(f"{check}{speed:.1f}x", callback_data=f"set_speed_{speed}"))
+    rows = []
+    for s in SPEED_OPTIONS:
+        check = "✅" if s == cur else ""
+        row.append(InlineKeyboardButton(f"{check}{s:.1f}x", callback_data=f"set_speed_{s}"))
         if len(row) == 4:
-            keyboard.append(row)
+            rows.append(row)
             row = []
     if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_settings")])
-    return InlineKeyboardMarkup(keyboard)
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
-def get_mode_menu_keyboard(user_id):
-    current_mode = get_user_mode(user_id)
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{'✅ ' if current_mode == 'simple' else ''}ရိုးရိုး Mode (SRT မပါ)",
-            callback_data="set_mode_simple"
-        )],
-        [InlineKeyboardButton(
-            f"{'✅ ' if current_mode == 'auto' else ''}ပုံမှန် Mode (SRT ပါ)",
-            callback_data="set_mode_auto"
-        )],
-        [InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_settings")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def mode_kb(user_id):
+    cur = get_user_mode(user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅ ' if cur=='simple' else ''}ရိုးရိုး (SRT မပါ)", callback_data="set_mode_simple")],
+        [InlineKeyboardButton(f"{'✅ ' if cur=='auto' else ''}ပုံမှန် (SRT ပါ)", callback_data="set_mode_auto")],
+        [InlineKeyboardButton("🔙 နောက်သို့", callback_data="back")]
+    ])
 
-# ========== Handlers ==========
+# ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    save_user(user_id)
+    save_user(update.effective_user.id)
     await update.message.reply_text(
         "👋 မင်္ဂလာပါ!\n\n"
-        "🎬 **YouTube / TikTok / Video** များကို မြန်မာလို အသံသွင်းပေးမယ်။\n\n"
-        "📌 **ဘာလုပ်နိုင်သလဲ:**\n"
-        "• YouTube Link ပို့ပါ\n"
-        "• TikTok Link ပို့ပါ\n"
-        "• Video ဖိုင် တိုက်ရိုက်ပို့ပါ\n\n"
-        "⚙️ **ဆက်တင်များ:** /settings\n"
-        "📖 **အသေးစိတ်:** /help",
+        "🎬 YouTube / TikTok Link သို့မဟုတ် Video ဖိုင် ပို့ပါ။\n"
+        "မြန်မာလို အသံသွင်းပေးပါမယ်။\n\n"
+        "⚙️ /settings | 📖 /help",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 **အသုံးပြုနည်း**\n\n"
-        "**Mode နှစ်မျိုး:**\n\n"
-        "1️⃣ **ရိုးရိုး Mode (SRT မပါ)**\n"
-        "   YouTube/TikTok/Video → Audio → စာသား → ဘာသာပြန် → TTS → ပေါင်းစပ်\n"
-        "   📝 SRT မပါ\n\n"
-        "2️⃣ **ပုံမှန် Mode (SRT ပါ)**\n"
-        "   အထက်ပါအတိုင်း + SRT subtitle\n\n"
-        "📌 YouTube/TikTok Link သို့မဟုတ် Video ဖိုင် ပို့ပါ။\n"
-        "⚙️ /settings မှာ ပြောင်းနိုင်ပါတယ်။\n\n"
-        "📌 **အမြန် command:**\n"
-        "• /b - Thiha (ကျား)\n"
-        "• /g - Nilar (မ)\n"
-        "• /speed 1.6\n"
-        "• /s - ရိုးရိုး Mode\n"
-        "• /sk - ပုံမှန် Mode",
+        "• YouTube / TikTok Link ပို့ပါ\n"
+        "• Video ဖိုင် တိုက်ရိုက်ပို့ပါ\n\n"
+        "Mode:\n"
+        "• ရိုးရိုး → SRT မပါ (ပိုမြန်)\n"
+        "• ပုံမှန် → SRT ဖိုင်ပါ\n\n"
+        "Command:\n"
+        "/b = Thiha | /g = Nilar\n"
+        "/speed 1.4 | /s = ရိုးရိုး | /sk = ပုံမှန်\n"
+        "/settings",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_media(update, context, video_path, source="Video"):
+    user_id = update.effective_user.id
+    mode = get_user_mode(user_id)
+    status = await update.message.reply_text(f"⏳ {source} လက်ခံပြီးပါပြီ။ Transcription လုပ်နေပါတယ်...")
+
+    try:
+        duration = get_duration(video_path)
+        save_session(user_id, {
+            "video_path": video_path,
+            "video_duration": duration,
+            "mode": mode
+        })
+
+        transcript = await transcribe(video_path)
+        if not transcript:
+            await status.edit_text("❌ စာသားထုတ်မရပါ။ Video တိုတိုလေး စမ်းကြည့်ပါ။")
+            cleanup_files(video_path)
+            clear_session(user_id)
+            return
+
+        await status.edit_text("🔄 ဘာသာပြန်နေပါတယ်...")
+        loop = asyncio.get_event_loop()
+        translated = await loop.run_in_executor(executor, translate_text, transcript)
+
+        await status.edit_text("🎙 အသံဖန်တီးနေပါတယ်...")
+        speed = get_user_speed(user_id)
+        voice_key = get_user_voice(user_id)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mp3_path = os.path.join(TEMP_FOLDER, f"tts_{user_id}_{ts}.mp3")
+        srt_path = os.path.join(TEMP_FOLDER, f"srt_{user_id}_{ts}.srt")
+
+        dur = await text_to_mp3(translated, mp3_path, speed, voice_key)
+
+        if mode == "auto":
+            srt_content = generate_srt(translated, dur)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+            save_session(user_id, {"srt_path": srt_path})
+
+        save_session(user_id, {"audio_path": mp3_path, "translated_text": translated})
+
+        # send audio
+        with open(mp3_path, "rb") as a:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=a,
+                caption=f"🎧 {get_voice_display(voice_key)} | {speed:.1f}x | {dur:.1f}s",
+                title="Myanmar Voice",
+                performer="AI"
+            )
+
+        await status.edit_text("🎬 Video ပေါင်းစပ်နေပါတယ်...")
+        await combine_video_audio(update, context, user_id, with_srt=(mode == "auto"))
+
+    except Exception as e:
+        logger.error(f"process_media error: {e}")
+        await status.edit_text(f"❌ Error: {str(e)[:120]}")
+        cleanup_files(video_path)
+        clear_session(user_id)
+    finally:
+        async with user_status_lock:
+            user_processing_status[user_id] = False
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user_id = update.effective_user.id
 
     async with user_status_lock:
-        if user_processing_status.get(user_id, False):
-            await update.message.reply_text("⏳ သင်၏ ယခင်တောင်းဆိုချက်ကို ဆောင်ရွက်နေဆဲပါ။ စောင့်ပေးပါ။")
+        if user_processing_status.get(user_id):
+            await update.message.reply_text("⏳ ယခင်အလုပ် ဆောင်ရွက်နေဆဲပါ။ စောင့်ပေးပါ။")
             return
         user_processing_status[user_id] = True
 
     async with global_processing_semaphore:
-        status_msg = None
+        status = await update.message.reply_text("⏳ Video Download လုပ်နေပါတယ်...")
         try:
             save_user(user_id)
             clear_session(user_id)
-            mode = get_user_mode(user_id)
 
-            status_msg = await update.message.reply_text("⏳ Video ကို Download လုပ်နေပါတယ်...")
-
-            video_path = None
-            source = "Unknown"
-            if "tiktok.com" in url:
-                video_path = await download_tiktok_video(url)
-                source = "TikTok"
-            elif "youtube.com" in url or "youtu.be" in url:
-                video_path = await download_youtube_video(url)
-                source = "YouTube"
-            else:
-                await status_msg.edit_text("❌ YouTube/TikTok Link ကိုသာ ပို့ပေးပါ။")
-                return
-
+            video_path = await download_video(url)
             if not video_path:
-                await status_msg.edit_text(f"❌ {source} Download မအောင်မြင်ပါ။")
+                await status.edit_text("❌ Download မအောင်မြင်ပါ။ Link မှန်ရဲ့လား စစ်ပါ။")
                 return
 
-            video_duration = get_video_duration_with_ffmpeg(video_path)
-            save_session(user_id, {
-                "video_path": video_path,
-                "video_duration": video_duration,
-                "is_voice": False,
-                "mode": mode
-            })
-
-            await status_msg.edit_text("📤 Video ကို ပို့နေပါတယ်...")
-            with open(video_path, "rb") as video_file:
-                caption = f"🎬 {source} Video"
-                if video_duration:
-                    caption += f"\n⏱️ {video_duration:.1f}s"
-                await update.message.reply_video(video=video_file, caption=caption)
-
-            await status_msg.edit_text("🎤 Audio ကို စာသားပြောင်းနေပါတယ်...")
-            transcript = await transcribe_audio(video_path)
-            if not transcript:
-                await status_msg.edit_text("❌ Transcription မအောင်မြင်ပါ။")
-                return
-
-            txt_filename = video_path.replace(".mp4", "_transcript.txt")
-            with open(txt_filename, "w", encoding="utf-8") as f:
-                f.write(transcript)
-
-            save_session(user_id, {
-                "transcript_text": transcript,
-                "edited_text": transcript
-            })
-
-            with open(txt_filename, "rb") as txt_file:
-                await update.message.reply_document(
-                    document=txt_file,
-                    filename="transcript.txt",
-                    caption="📝 စာသားဖိုင်\n✍️ ပြင်ဆင်ပြီး ပြန်ပို့နိုင်ပါတယ်။"
-                )
-
-            await status_msg.edit_text("🔄 ဘာသာပြန်နေပါသည်...")
-            loop = asyncio.get_event_loop()
-            translated = await loop.run_in_executor(
-                executor, translate_story_style, transcript, "en", "my"
-            )
-
-            save_session(user_id, {
-                "translated_text": translated,
-                "edited_text": translated
-            })
-
-            txt_filename = f"translated_{user_id}_{int(time.time())}.txt"
-            with open(txt_filename, "w", encoding="utf-8") as f:
-                f.write(translated)
-
-            with open(txt_filename, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename="translated_myanmar.txt",
-                    caption="📝 မြန်မာလို ဘာသာပြန်"
-                )
-
-            await status_msg.edit_text("🎙 အသံဖိုင် ဖန်တီးနေပါသည်...")
-            speed = get_user_speed(user_id)
-            voice_key = get_user_voice(user_id)
-            voice_name = get_voice_display(voice_key)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_file = f"tts_{user_id}_{timestamp}.mp3"
-            srt_file = f"tts_srt_{user_id}_{timestamp}.srt"
-
-            actual_duration = await convert_text_to_mp3(translated, output_file, speed, voice_key)
-
-            if mode == "auto":
-                srt_content = generate_srt_advanced(translated, voice_name, speed, actual_duration)
-                with open(srt_file, "w", encoding="utf-8") as srt_f:
-                    srt_f.write(srt_content)
-                save_session(user_id, {"srt_path": srt_file})
-
-            save_session(user_id, {"audio_path": output_file})
-
-            with open(output_file, "rb") as audio:
-                caption = (
-                    f"🎧 အသံဖိုင်\n"
-                    f"🎤 {voice_name}\n"
-                    f"⚡ {speed:.1f}x\n"
-                    f"⏱ {actual_duration:.1f}s"
-                )
-                caption += "\n📝 SRT ပါမယ်။" if mode == "auto" else "\n📝 SRT မပါပါ။"
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio,
-                    caption=caption,
-                    title=f"Voice_{voice_key}",
-                    performer="AI Voice"
-                )
-
-            if mode == "auto" and os.path.exists(srt_file):
-                with open(srt_file, "rb") as document:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=document,
-                        filename="subtitle.srt",
-                        caption="📝 Subtitle (SRT)"
-                    )
-
-            await status_msg.edit_text("🎬 Video ပေါင်းစပ်နေပါသည်...")
-            if mode == "simple":
-                await process_video_simple(update, context, user_id)
-            else:
-                await process_video_with_audio_speed(update, context, user_id)
-
+            await status.delete()
+            await process_media(update, context, video_path, source="YouTube/TikTok")
         except Exception as e:
-            logger.error(f"handle_youtube_link error: {e}")
-            try:
-                if status_msg:
-                    await status_msg.edit_text(f"❌ Error: {str(e)[:150]}")
-            except Exception:
-                pass
+            logger.error(f"handle_link: {e}")
+            await status.edit_text(f"❌ Error: {str(e)[:100]}")
         finally:
             async with user_status_lock:
                 user_processing_status[user_id] = False
 
-async def handle_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     async with user_status_lock:
-        if user_processing_status.get(user_id, False):
-            await update.message.reply_text("⏳ ယခင်တောင်းဆိုချက် ဆောင်ရွက်နေဆဲပါ။")
+        if user_processing_status.get(user_id):
+            await update.message.reply_text("⏳ ယခင်အလုပ် ဆောင်ရွက်နေဆဲပါ။")
             return
         user_processing_status[user_id] = True
 
     async with global_processing_semaphore:
-        status_msg = None
         try:
             save_user(user_id)
             clear_session(user_id)
-            mode = get_user_mode(user_id)
-
-            status_msg = await update.message.reply_text("⏳ Video ကို လက်ခံနေပါတယ်...")
 
             video = update.message.video
             if not video:
-                await status_msg.edit_text("❌ Video ဖိုင်မတွေ့ပါ။")
+                await update.message.reply_text("❌ Video မတွေ့ပါ။")
                 return
 
-            video_file = await video.get_file()
-            video_path = os.path.join(TEMP_FOLDER, f"uploaded_{user_id}_{int(time.time())}.mp4")
-            await video_file.download_to_drive(video_path)
+            status = await update.message.reply_text("⏳ Video လက်ခံနေပါတယ်...")
+            f = await video.get_file()
+            path = os.path.join(TEMP_FOLDER, f"up_{user_id}_{int(time.time())}.mp4")
+            await f.download_to_drive(path)
 
-            if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
-                await status_msg.edit_text("❌ Download မအောင်မြင်ပါ။")
+            if not os.path.exists(path) or os.path.getsize(path) < 1000:
+                await status.edit_text("❌ Download မအောင်မြင်ပါ။")
                 return
 
-            video_duration = video.duration or get_video_duration_with_ffmpeg(video_path)
-            save_session(user_id, {
-                "video_path": video_path,
-                "video_duration": video_duration,
-                "is_voice": False,
-                "mode": mode
-            })
-
-            await status_msg.edit_text(
-                f"✅ Video လက်ခံရရှိပါပြီ။\n⏱️ {video_duration:.1f}s\n\n🎤 Transcription လုပ်နေပါတယ်..."
-            )
-
-            transcript = await transcribe_audio(video_path)
-            if not transcript:
-                await status_msg.edit_text("❌ Transcription မအောင်မြင်ပါ။")
-                return
-
-            txt_filename = video_path.replace(".mp4", "_transcript.txt")
-            with open(txt_filename, "w", encoding="utf-8") as f:
-                f.write(transcript)
-
-            save_session(user_id, {
-                "transcript_text": transcript,
-                "edited_text": transcript
-            })
-
-            with open(txt_filename, "rb") as txt_file:
-                await update.message.reply_document(
-                    document=txt_file,
-                    filename="transcript.txt",
-                    caption="📝 စာသားဖိုင်\n✍️ ပြင်ဆင်ပြီး ပြန်ပို့နိုင်ပါတယ်။"
-                )
-
-            await status_msg.edit_text("🔄 ဘာသာပြန်နေပါသည်...")
-            loop = asyncio.get_event_loop()
-            translated = await loop.run_in_executor(
-                executor, translate_story_style, transcript, "en", "my"
-            )
-
-            save_session(user_id, {
-                "translated_text": translated,
-                "edited_text": translated
-            })
-
-            txt_filename = f"translated_{user_id}_{int(time.time())}.txt"
-            with open(txt_filename, "w", encoding="utf-8") as f:
-                f.write(translated)
-
-            with open(txt_filename, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename="translated_myanmar.txt",
-                    caption="📝 မြန်မာလို ဘာသာပြန်"
-                )
-
-            await status_msg.edit_text("🎙 အသံဖိုင် ဖန်တီးနေပါသည်...")
-            speed = get_user_speed(user_id)
-            voice_key = get_user_voice(user_id)
-            voice_name = get_voice_display(voice_key)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_file = f"tts_{user_id}_{timestamp}.mp3"
-            srt_file = f"tts_srt_{user_id}_{timestamp}.srt"
-
-            actual_duration = await convert_text_to_mp3(translated, output_file, speed, voice_key)
-
-            if mode == "auto":
-                srt_content = generate_srt_advanced(translated, voice_name, speed, actual_duration)
-                with open(srt_file, "w", encoding="utf-8") as srt_f:
-                    srt_f.write(srt_content)
-                save_session(user_id, {"srt_path": srt_file})
-
-            save_session(user_id, {"audio_path": output_file})
-
-            with open(output_file, "rb") as audio:
-                caption = (
-                    f"🎧 အသံဖိုင်\n"
-                    f"🎤 {voice_name}\n"
-                    f"⚡ {speed:.1f}x\n"
-                    f"⏱ {actual_duration:.1f}s"
-                )
-                caption += "\n📝 SRT ပါမယ်။" if mode == "auto" else "\n📝 SRT မပါပါ။"
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio,
-                    caption=caption,
-                    title=f"Voice_{voice_key}",
-                    performer="AI Voice"
-                )
-
-            if mode == "auto" and os.path.exists(srt_file):
-                with open(srt_file, "rb") as document:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=document,
-                        filename="subtitle.srt",
-                        caption="📝 Subtitle (SRT)"
-                    )
-
-            await status_msg.edit_text("🎬 Video ပေါင်းစပ်နေပါသည်...")
-            if mode == "simple":
-                await process_video_simple(update, context, user_id)
-            else:
-                await process_video_with_audio_speed(update, context, user_id)
-
+            await status.delete()
+            await process_media(update, context, path, source="Uploaded Video")
         except Exception as e:
-            logger.error(f"handle_video_file error: {e}")
-            try:
-                if status_msg:
-                    await status_msg.edit_text(f"❌ Error: {str(e)[:150]}")
-            except Exception:
-                pass
+            logger.error(f"handle_video: {e}")
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
         finally:
             async with user_status_lock:
                 user_processing_status[user_id] = False
 
-async def handle_transcript_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
+async def handle_text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # optional: edited transcript → re-translate + TTS
+    pass
 
-    if text.startswith("/") or text.startswith("http"):
-        return
+async def cmd_b(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.effective_user.id, voice="thiha")
+    await update.message.reply_text(f"✅ {get_voice_display('thiha')}")
 
-    async with user_status_lock:
-        if user_processing_status.get(user_id, False):
-            await update.message.reply_text("⏳ ယခင်တောင်းဆိုချက် ဆောင်ရွက်နေဆဲပါ။")
-            return
-        user_processing_status[user_id] = True
+async def cmd_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.effective_user.id, voice="nilar")
+    await update.message.reply_text(f"✅ {get_voice_display('nilar')}")
 
-    async with global_processing_semaphore:
-        try:
-            session = get_session(user_id)
-            if not session:
-                await update.message.reply_text("⚠️ ကျေးဇူးပြုပြီး YouTube/TikTok Link ကို အရင်ပို့ပါ။")
-                return
-
-            mode = get_user_mode(user_id)
-            save_session(user_id, {"edited_text": text})
-
-            await update.message.reply_text(
-                "📝 စာသားကို ရရှိပါပြီ။\n\n🔄 မြန်မာလို ဘာသာပြန်နေပါသည်..."
-            )
-
-            loop = asyncio.get_event_loop()
-            translated = await loop.run_in_executor(
-                executor, translate_story_style, text, "en", "my"
-            )
-
-            save_session(user_id, {"translated_text": translated})
-
-            txt_filename = f"translated_{user_id}_{int(time.time())}.txt"
-            with open(txt_filename, "w", encoding="utf-8") as f:
-                f.write(translated)
-
-            with open(txt_filename, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename="translated_myanmar.txt",
-                    caption="📝 မြန်မာလို ဘာသာပြန်"
-                )
-
-            await update.message.reply_text("🎙 အသံဖိုင် ဖန်တီးနေပါသည်...")
-
-            speed = get_user_speed(user_id)
-            voice_key = get_user_voice(user_id)
-            voice_name = get_voice_display(voice_key)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            output_file = f"tts_{user_id}_{timestamp}.mp3"
-            srt_file = f"tts_srt_{user_id}_{timestamp}.srt"
-
-            actual_duration = await convert_text_to_mp3(translated, output_file, speed, voice_key)
-
-            if mode == "auto":
-                srt_content = generate_srt_advanced(translated, voice_name, speed, actual_duration)
-                with open(srt_file, "w", encoding="utf-8") as srt_f:
-                    srt_f.write(srt_content)
-                save_session(user_id, {"srt_path": srt_file})
-
-            save_session(user_id, {"audio_path": output_file})
-
-            with open(output_file, "rb") as audio:
-                caption = (
-                    f"🎧 အသံဖိုင်\n"
-                    f"🎤 {voice_name}\n"
-                    f"⚡ {speed:.1f}x\n"
-                    f"⏱ {actual_duration:.1f}s"
-                )
-                caption += "\n📝 SRT ပါမယ်။" if mode == "auto" else "\n📝 SRT မပါပါ။"
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio,
-                    caption=caption,
-                    title=f"Voice_{voice_key}",
-                    performer="AI Voice"
-                )
-
-            if mode == "auto" and os.path.exists(srt_file):
-                with open(srt_file, "rb") as document:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=document,
-                        filename="subtitle.srt",
-                        caption="📝 Subtitle (SRT)"
-                    )
-
-            await update.message.reply_text("🎬 Video ပေါင်းစပ်နေပါသည်...")
-            if mode == "simple":
-                await process_video_simple(update, context, user_id)
-            else:
-                await process_video_with_audio_speed(update, context, user_id)
-
-        except Exception as e:
-            logger.error(f"handle_transcript_edit error: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)[:150]}")
-        finally:
-            async with user_status_lock:
-                user_processing_status[user_id] = False
-
-async def voice_command_b(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    save_user(user_id, voice="thiha")
-    await update.message.reply_text(
-        f"✅ အသံကို *{get_voice_display('thiha')}* သို့ ပြောင်းလိုက်ပါပြီ။",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def voice_command_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    save_user(user_id, voice="nilar")
-    await update.message.reply_text(
-        f"✅ အသံကို *{get_voice_display('nilar')}* သို့ ပြောင်းလိုက်ပါပြီ။",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def cmd_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = update.message.text.split()
     if len(args) < 2:
-        current = get_user_speed(user_id)
-        await update.message.reply_text(
-            f"⚡ လက်ရှိ Speed: *{current:.1f}x*\n\n"
-            f"ပြောင်းရန်: `/speed 1.6`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text(f"⚡ လက်ရှိ: {get_user_speed(update.effective_user.id):.1f}x\nဥပမာ: /speed 1.4")
         return
     try:
-        speed = float(args[1])
-        if speed < 0.8 or speed > 2.0:
-            await update.message.reply_text("⚠️ Speed ကို 0.8 - 2.0 ကြားမှာသာ ရွေးနိုင်ပါတယ်။")
-            return
-        closest = min(SPEED_OPTIONS, key=lambda x: abs(x - speed))
-        save_user(user_id, speed=closest)
-        await update.message.reply_text(
-            f"✅ Speed ကို *{closest:.1f}x* သို့ ပြောင်းလိုက်ပါပြီ။",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except ValueError:
-        await update.message.reply_text("⚠️ နံပါတ်ဖြင့် ရိုက်ပါ။ ဥပမာ: `/speed 1.6`")
+        sp = float(args[1])
+        closest = min(SPEED_OPTIONS, key=lambda x: abs(x - sp))
+        save_user(update.effective_user.id, speed=closest)
+        await update.message.reply_text(f"✅ Speed {closest:.1f}x")
+    except Exception:
+        await update.message.reply_text("⚠️ ဥပမာ: /speed 1.4")
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(
-        "⚙️ **ဆက်တင်များ**\n\nအောက်ပါခလုတ်များကို နှိပ်၍ ပြောင်းလဲနိုင်ပါတယ်။",
-        reply_markup=get_settings_keyboard(user_id),
-        parse_mode=ParseMode.MARKDOWN
-    )
+async def cmd_s(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_user_mode(update.effective_user.id, "simple")
+    await update.message.reply_text("✅ ရိုးရိုး Mode (SRT မပါ)")
 
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    data = query.data
+async def cmd_sk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_user_mode(update.effective_user.id, "auto")
+    await update.message.reply_text("✅ ပုံမှန် Mode (SRT ပါ)")
 
-    if data == "show_voice_menu":
-        await query.edit_message_text(
-            "🎤 **အသံရွေးချယ်ရန်**",
-            reply_markup=get_voice_menu_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "show_speed_menu":
-        await query.edit_message_text(
-            "⚡ **အမြန်နှုန်းရွေးချယ်ရန်**",
-            reply_markup=get_speed_menu_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "show_mode_menu":
-        await query.edit_message_text(
-            "📌 **Mode ရွေးချယ်ရန်**\n\n"
-            "• **ရိုးရိုး Mode** - SRT မပါ (ပိုမြန်)\n"
-            "• **ပုံမှန် Mode** - SRT ပါ",
-            reply_markup=get_mode_menu_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data.startswith("set_voice_"):
-        voice_key = data.replace("set_voice_", "")
-        if voice_key in VOICES:
-            save_user(user_id, voice=voice_key)
-            await query.edit_message_text(
-                f"✅ အသံကို *{get_voice_display(voice_key)}* သို့ ပြောင်းလိုက်ပါပြီ။",
-                reply_markup=get_settings_keyboard(user_id),
-                parse_mode=ParseMode.MARKDOWN
-            )
-    elif data.startswith("set_speed_"):
-        speed = float(data.replace("set_speed_", ""))
-        save_user(user_id, speed=speed)
-        await query.edit_message_text(
-            f"✅ အမြန်နှုန်းကို *{speed:.1f}x* သို့ ပြောင်းလိုက်ပါပြီ။",
-            reply_markup=get_settings_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "set_mode_simple":
-        set_user_mode(user_id, "simple")
-        await query.edit_message_text(
-            "✅ **ရိုးရိုး Mode (SRT မပါ)** သို့ ပြောင်းလိုက်ပါပြီ။",
-            reply_markup=get_settings_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "set_mode_auto":
-        set_user_mode(user_id, "auto")
-        await query.edit_message_text(
-            "✅ **ပုံမှန် Mode (SRT ပါ)** သို့ ပြောင်းလိုက်ပါပြီ။",
-            reply_markup=get_settings_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "back_to_settings":
-        await query.edit_message_text(
-            "⚙️ **ဆက်တင်များ**",
-            reply_markup=get_settings_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "help_menu":
-        await query.edit_message_text(
-            "📖 အကူအညီ — /help ကို ကြည့်ပါ။",
-            reply_markup=get_settings_keyboard(user_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "close_menu":
-        await query.edit_message_text("✅ ဆက်တင်များကို ပိတ်လိုက်ပါပြီ။")
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ ဆက်တင်များ", reply_markup=settings_kb(update.effective_user.id))
 
-async def mode_s(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    set_user_mode(user_id, "simple")
-    await update.message.reply_text(
-        "✅ **ရိုးရိုး Mode (SRT မပါ)** သို့ ပြောင်းလိုက်ပါပြီ။\n\n"
-        "📌 Video + Audio ကိုပဲ ပေါင်းပေးမယ်။\n"
-        "⏱ ပိုမြန်ဆန်ပါတယ်။",
-        parse_mode=ParseMode.MARKDOWN
-    )
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    d = q.data
 
-async def mode_sk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    set_user_mode(user_id, "auto")
-    await update.message.reply_text(
-        "✅ **ပုံမှန် Mode (SRT ပါ)** သို့ ပြောင်းလိုက်ပါပြီ။\n\n"
-        "📌 SRT subtitle ပါမယ်။",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    if d == "show_voice":
+        await q.edit_message_text("🎤 အသံရွေးပါ", reply_markup=voice_kb(uid))
+    elif d == "show_speed":
+        await q.edit_message_text("⚡ အမြန်နှုန်းရွေးပါ", reply_markup=speed_kb(uid))
+    elif d == "show_mode":
+        await q.edit_message_text("📌 Mode ရွေးပါ", reply_markup=mode_kb(uid))
+    elif d.startswith("set_voice_"):
+        key = d.replace("set_voice_", "")
+        save_user(uid, voice=key)
+        await q.edit_message_text(f"✅ {get_voice_display(key)}", reply_markup=settings_kb(uid))
+    elif d.startswith("set_speed_"):
+        sp = float(d.replace("set_speed_", ""))
+        save_user(uid, speed=sp)
+        await q.edit_message_text(f"✅ {sp:.1f}x", reply_markup=settings_kb(uid))
+    elif d == "set_mode_simple":
+        set_user_mode(uid, "simple")
+        await q.edit_message_text("✅ ရိုးရိုး Mode", reply_markup=settings_kb(uid))
+    elif d == "set_mode_auto":
+        set_user_mode(uid, "auto")
+        await q.edit_message_text("✅ ပုံမှန် Mode", reply_markup=settings_kb(uid))
+    elif d == "back":
+        await q.edit_message_text("⚙️ ဆက်တင်များ", reply_markup=settings_kb(uid))
+    elif d == "close":
+        await q.edit_message_text("✅ ပိတ်လိုက်ပါပြီ")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
 
-# ========== Main ==========
+# ==================== MAIN ====================
 def main():
     init_db()
     delete_old_sessions()
 
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .connect_timeout(60.0)
-        .read_timeout(60.0)
-        .write_timeout(60.0)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("s", mode_s))
-    application.add_handler(CommandHandler("sk", mode_sk))
-    application.add_handler(CommandHandler("b", voice_command_b))
-    application.add_handler(CommandHandler("g", voice_command_g))
-    application.add_handler(CommandHandler("speed", speed_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("b", cmd_b))
+    app.add_handler(CommandHandler("g", cmd_g))
+    app.add_handler(CommandHandler("speed", cmd_speed))
+    app.add_handler(CommandHandler("s", cmd_s))
+    app.add_handler(CommandHandler("sk", cmd_sk))
+    app.add_handler(CallbackQueryHandler(callback))
 
-    application.add_handler(CallbackQueryHandler(settings_callback))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(r"youtube\.com|youtu\.be|tiktok\.com"),
+        handle_link
+    ))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(r"youtube\.com|youtu\.be|tiktok\.com"),
-            handle_youtube_link
-        )
-    )
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video_file))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transcript_edit))
+    app.add_error_handler(error_handler)
 
-    application.add_error_handler(error_handler)
-
-    logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot starting (low RAM mode - Whisper tiny)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
