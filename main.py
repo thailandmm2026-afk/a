@@ -1534,12 +1534,12 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & \~filters.COMMAND & filters.Regex(r"youtube\.com|youtu\.be|tiktok\.com"),
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"youtube\.com|youtu\.be|tiktok\.com"),
             handle_youtube_link
         )
     )
     application.add_handler(MessageHandler(filters.VIDEO, handle_video_file))
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_transcript_edit))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_transcript_edit))
 
     application.add_error_handler(error_handler)
 
