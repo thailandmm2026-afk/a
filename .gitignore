@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+venv/
+ENV/
+temp_files/
+*.mp4
+*.mp3
+*.srt
+bot_data.db
+*.log
+.DS_Store
+*.txt
+!requirements.txt
